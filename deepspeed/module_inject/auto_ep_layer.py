@@ -38,9 +38,10 @@ from deepspeed.module_inject.auto_ep_folding import (mark_autoep_folding_exact_e
                                                      mark_autoep_folding_router_parameter)
 from deepspeed.ops.triton_ops import autoep_fused_token_ops as fused_token_ops
 from deepspeed.utils import logger
-from deepspeed.module_inject.auto_ep_comm import (COMM_BACKEND, DEEPEP_BACKEND, DeepEPCheckpointReplay, _in_backward,
-                                                  assert_dtype_supported, deepep_combine, deepep_dispatch,
-                                                  deepep_record_combine, new_exchange_scope, shared_exchange)
+from deepspeed.module_inject.auto_ep_comm import (COMM_BACKEND, DEEPEP_BACKEND, TWO_LEVEL_BACKEND,
+                                                  DeepEPCheckpointReplay, _in_backward, assert_dtype_supported,
+                                                  deepep_combine, deepep_dispatch, deepep_record_combine,
+                                                  new_exchange_scope, shared_exchange)
 from deepspeed.moe.ep_router import TokenChoiceTopKRouter
 from deepspeed.moe.ep_count import count_tokens_per_expert
 from deepspeed.moe.ep_experts import ExpertWeightGradSlot, GroupedExperts
@@ -799,6 +800,7 @@ class AutoEPMoELayer(nn.Module):
         # Resolved once per layer: a DeepEP exchange sizes its buffer at
         # construction, so it is built on first use and kept.
         self.comm_backend = config.comm_backend
+        self._two_level_topology = None
         self.comm_num_sm = config.comm_num_sm
         self.comm_qp_margin = config.comm_qp_margin
         self._deepep_exchange = None
@@ -1009,6 +1011,7 @@ class AutoEPMoELayer(nn.Module):
             self.ep_group = folding_group_handles.ep_group
             self.tp_group = folding_group_handles.tp_group
             self.ep_rank = dist.get_rank(group=self.ep_group)
+            self._bind_two_level_topology()
             return
 
         if self.ep_group_name not in groups._get_expert_parallel_group_dict():
@@ -1026,6 +1029,45 @@ class AutoEPMoELayer(nn.Module):
                 use_data_before_expert_parallel_=use_data_before_expert_parallel_,
             )
         self.ep_group = groups._get_expert_parallel_group(self.ep_group_name)
+        self._bind_two_level_topology()
+
+    def _bind_two_level_topology(self) -> None:
+        if self.comm_backend != TWO_LEVEL_BACKEND or self.ep_size == 1:
+            return
+        from deepspeed.moe.ep_two_level import two_level_topology
+        topology = two_level_topology(self.ep_group, self.ep_group_name)
+        if topology.num_nodes == 1:
+            # Nothing crosses the network, so the second level would only add collectives.
+            logger.warning_once(f'comm_backend="two_level": expert-parallel group {self.ep_group_name} lies inside '
+                                'one node, so its layers use the "comm" path.')
+            return
+        self._two_level_topology = topology
+
+    def _two_level_route(self, tokens: torch.Tensor, ro: "RouterOutput") -> torch.Tensor:
+        """Dispatch, run the experts and combine over the two-level path; returns [T, H]."""
+        from deepspeed.moe.ep_two_level import two_level_route
+
+        def run_experts(rows, counts):
+            permuted, permuted_indices, aligned_counts, num_rows = permute_by_local_expert(rows, counts)
+            return unpermute_by_local_expert(self.experts(permuted, aligned_counts), permuted_indices, num_rows)
+
+        topology = self._two_level_topology
+        if topology.rank_node.device != tokens.device:
+            # once: the route reads these on the device at every call
+            topology = self._two_level_topology = topology._replace(rank_node=topology.rank_node.to(tokens.device),
+                                                                    rank_local=topology.rank_local.to(tokens.device))
+
+        return two_level_route(tokens,
+                               ro.top_scores,
+                               ro.selected_experts,
+                               topology=topology,
+                               ep_group=self.ep_group,
+                               ep_size=self.ep_size,
+                               num_experts=self.num_experts,
+                               num_local_experts=self.num_local_experts,
+                               score_apply=self.score_apply,
+                               run_experts=run_experts,
+                               all_to_all_v=_AllToAllV.apply)
 
     def attach_decoder_layer(self, decoder_layer: nn.Module) -> None:
         """Record the decoder layer whose checkpoint skip_recompute_combine requires."""
@@ -1290,6 +1332,13 @@ class AutoEPMoELayer(nn.Module):
         if self.ep_size > 1 and self.comm_backend == DEEPEP_BACKEND:
             output = self._deepep_route(x, ro).reshape(bsz, seqlen, hdim)
             return self._finalize_output(output, x, hidden_states, hdim)
+
+        if self.comm_backend == TWO_LEVEL_BACKEND and self._two_level_topology is not None:
+            output = self._two_level_route(x, ro)
+            if sequence_sharded:
+                output = self._gather_token_shards(output, all_tokens.shape[0])
+            output = output.reshape(bsz, seqlen, hdim)
+            return self._finalize_output(output, all_tokens, hidden_states, hdim, token_shard=token_shard)
 
         # Reorder tokens into expert-contiguous order.
         token_indices_sorted = torch.argsort(ro.selected_experts.view(-1), stable=True)

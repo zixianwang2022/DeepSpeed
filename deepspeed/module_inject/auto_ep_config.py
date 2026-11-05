@@ -223,7 +223,7 @@ def validate_autoep_config(
                          "leave gate_up_impl unset.")
 
     # Validate comm_backend
-    valid_comm_backend = ("comm", "deepep")
+    valid_comm_backend = ("comm", "deepep", "two_level")
     if config.comm_backend not in valid_comm_backend:
         raise ValueError(f"comm_backend must be one of {valid_comm_backend}, "
                          f"got '{config.comm_backend}'")
@@ -251,6 +251,22 @@ def validate_autoep_config(
             raise ValueError("overlap_weight_grad withholds DeepEP's SMs from the weight-gradient GEMMs through "
                              "torch._C._set_sm_carveout_experimental, which this PyTorch build lacks. Upgrade "
                              "PyTorch, or leave overlap_weight_grad unset.")
+
+    if config.comm_backend == "two_level":
+        if pp_size > 1:
+            raise ValueError('comm_backend="two_level" does not support pipeline parallelism: every rank of the job '
+                             f'must join when its node groups are built. Got pp_size={pp_size}; use '
+                             'comm_backend="comm".')
+        if tp_size > 1 and not config.sequence_sharded_moe:
+            raise ValueError('comm_backend="two_level" needs whole tokens on each peer, which assignment-level '
+                             "AutoEP+AutoTP folding does not have. Set expert_parallel.sequence_sharded_moe, or "
+                             'comm_backend to "comm".')
+        if config.combine_impl not in ("auto", "weighted_sum"):
+            raise ValueError(f'combine_impl="{config.combine_impl}" cannot be used with comm_backend="two_level", '
+                             "which adds the weighted rows on the destination node. Leave combine_impl unset.")
+        if config.async_split_plan:
+            raise ValueError('expert_parallel.async_split_plan does not apply to comm_backend="two_level", whose '
+                             "count exchange also carries the node-local counts. Disable async_split_plan.")
 
     if config.row_weighting_impl == "fused":
         if config.comm_backend != "deepep":

@@ -14,6 +14,11 @@ before::
 
     "expert_parallel": {"comm_backend": "comm"}      # default
     "expert_parallel": {"comm_backend": "deepep"}
+    "expert_parallel": {"comm_backend": "two_level"}
+
+``two_level`` is the collective path with another routing of the rows (one per
+token and destination node); the layer runs it itself, see
+``deepspeed/moe/ep_two_level.py``.
 
 A backend is asked for once per layer and reused, because DeepEP's buffers are
 sized at construction and are expensive to rebuild.
@@ -34,7 +39,9 @@ COMM_BACKEND = "comm"
 # Names the library, not its version: v2 is the only path implemented, and
 # nothing about the name would have to change if that ever grew.
 DEEPEP_BACKEND = "deepep"
-AVAILABLE_BACKENDS = (COMM_BACKEND, DEEPEP_BACKEND)
+# The default transport with one row per token per destination node; see deepspeed.moe.ep_two_level.
+TWO_LEVEL_BACKEND = "two_level"
+AVAILABLE_BACKENDS = (COMM_BACKEND, DEEPEP_BACKEND, TWO_LEVEL_BACKEND)
 # GIN, and so DeepEP, does not exist in any form below this NCCL version.
 NCCL_GIN_MIN_VERSION = (2, 30, 4)
 # The config's comm_num_sm default. The collective and the expert GEMM share

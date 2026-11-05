@@ -943,6 +943,12 @@ Configure AutoEP expert parallelism for MoE models. AutoEP automatically detects
 
 This option reduces the host synchronization exposed by reading split sizes; it does not hide the expert-count AllToAll. Benchmark it with your target model, token count, EP size, and hardware before enabling it. For small workloads, stream/event overhead can outweigh the overlap benefit.
 
+***comm_backend***: [string]
+
+| Description                                                                                                                                                                             | Default  |
+| --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------- |
+| How expert rows move: `"comm"` (DeepSpeed collectives), `"deepep"` (DeepEP's dispatch and combine kernels), or `"two_level"` (DeepSpeed collectives, one row per token per destination node, with copies inside the node). `"two_level"` rejects `pp_size` above 1, `combine_impl` other than `"auto"` or `"weighted_sum"`, and `async_split_plan`; under AutoTP it needs `sequence_sharded_moe`. | `"comm"` |
+
 ***sequence_sharded_moe***: [boolean]
 
 | Description                                                                                                                                                                             | Default |

@@ -182,7 +182,9 @@ that set nothing keep the existing path unchanged.
     }
 
 - ``comm_backend``: ``"comm"`` (default) uses ``deepspeed.comm`` collectives;
-  ``"deepep"`` uses DeepEP's dispatch and combine kernels.
+  ``"deepep"`` uses DeepEP's dispatch and combine kernels; ``"two_level"`` uses
+  ``deepspeed.comm`` collectives and sends each token once per destination node
+  (see "Two-level expert exchange").
 - ``comm_num_sm``: SMs given to communication. Default 12.
 - ``comm_qp_margin``: RDMA queue pairs reserved beyond one per SM. Default 4.
 - ``comm_max_tokens_per_rank``: largest per-rank token count the job will
@@ -803,6 +805,47 @@ This follows the sequence-sharded MoE block of X-MoE (`arXiv 2508.13337 <https:/
   the tensor-parallel peers.
 - Each peer backpropagates its own shard, so router gradients are true partials that are summed across the
   peers, and expert gradients need no ``tp_size`` correction.
+
+Two-level expert exchange
+-------------------------
+
+A token routed to k experts is k rows on the default all-to-all, even when several of those experts sit on one
+node and the rows are identical. With ``comm_backend="two_level"``, a token crosses the network once per
+destination node and is copied to its other experts inside the node, and the weighted outputs are added inside
+the node on the way back. This follows the redundancy-bypassing dispatch of X-MoE
+(`arXiv 2508.13337 <https://arxiv.org/abs/2508.13337>`__). It needs nothing beyond the default backend's collectives.
+
+.. code-block:: json
+
+    {
+      "expert_parallel": {
+        "enabled": true,
+        "autoep_size": 16,
+        "comm_backend": "two_level"
+      }
+    }
+
+- It removes rows only when expert parallelism spans nodes and tokens choose several experts on one node. A token
+  that chooses k of E experts spread evenly over N nodes reaches ``N * (1 - C(E - E/N, k) / C(E, k))`` nodes on
+  average under uniform routing, so with 128 experts and top-6 the rows that cross the network drop by 67 % at
+  2 nodes, 45 % at 4 and 25 % at 8.
+- It costs collectives: 7 in the forward and 5 in the backward of a layer, against 3 and 2 with ``"comm"``. The extra
+  ones carry counts, addresses, weights and node-local rows. So it is not always faster: it gains where the rows
+  on the network dominate, which is few nodes per expert-parallel group and a wide hidden size, and where the
+  transport between the GPUs of a node is fast, because the rows it takes off the network are exchanged inside the
+  node instead. Measure it on your model and layout.
+- When an expert-parallel group lies inside one node there is nothing to remove, and its layers use the
+  ``"comm"`` path (a warning says so).
+- A node's outputs and a token's returned rows are added in float32 and rounded once; on a GPU they are added in a
+  fixed order, so two runs give the same bits there. A node's sum is rounded to the training dtype before it
+  returns, which ``"comm"`` does not do, so the two backends agree to rounding, not bit for bit.
+- The ranks of an expert-parallel group are grouped into nodes by host name.
+- ``combine_impl`` other than ``"auto"`` or ``"weighted_sum"`` is rejected, because the weighted rows are added on
+  the destination node, and so is ``async_split_plan``, because the count exchange also carries the node-local
+  counts.
+- Under AutoTP it requires ``sequence_sharded_moe``, because it needs whole tokens on each peer.
+- ``pp_size`` above 1 is rejected: the node groups are created by a collective that every rank of the job must
+  join.
 
 Chunked causal-LM loss
 ----------------------
