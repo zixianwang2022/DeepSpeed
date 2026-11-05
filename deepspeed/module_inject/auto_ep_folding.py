@@ -19,6 +19,7 @@ AUTOEP_FOLDING_PARAM_FAMILY_ATTR = "ds_autoep_folding_param_family"
 AUTOEP_FOLDING_ROUTER_GATE_REPLICATED_PARAM = "router_gate_replicated"
 AUTOEP_FOLDING_ROUTER_GATE_PARTIAL_PARAM = "router_gate_partial"
 AUTOEP_FOLDING_SP_SHARDED_LAYERNORM_PARAM = "sp_sharded_layernorm"
+AUTOEP_FOLDING_ROUTED_EXPERT_EXACT_PARAM = "routed_expert_exact"
 AUTOEP_FOLDING_GRAD_CORRECTED_ATTR = "ds_autoep_folding_grad_corrected"
 AUTOEP_FOLDING_GRAD_REDUCE_SKIP = "skip"
 AUTOEP_FOLDING_GRAD_REDUCE_SUM = "sum"
@@ -232,7 +233,8 @@ def validate_folding_global(
     # the EP layout: router/gate and dense/LayerNorm AVERAGE over the TP
     # (token-replication) group; routed experts cancel the restore ``tp_size``
     # factor (EXPERT_TP_CANCEL) and reduce data-parallel over
-    # the EDP group. The earlier ``expert_width <= dp`` / ``dp % expert_width == 0``
+    # the EDP group (under ``sequence_sharded_moe`` there is no such factor and
+    # the router is a SUM partial, see ``autoep_folding_param_grad_reduce_strategy``). The earlier ``expert_width <= dp`` / ``dp % expert_width == 0``
     # fail-fast limitation is therefore removed; only genuinely non-tiling shapes are
     # rejected above (in ``build_folding_spec``).
 
@@ -275,8 +277,9 @@ def validate_folding_global(
 def mark_autoep_folding_router_parameter(param) -> None:
     """Tag a router/gate parameter as the *replicated* folded family (AVERAGE).
 
-    This is the ONLY family marker applied on the live forward path today:
-    ``AutoEPMoELayer.__init__`` marks every ``router.*`` parameter with it. The
+    ``AutoEPMoELayer.__init__`` marks every ``router.*`` parameter with it under
+    assignment-level folding (under ``expert_parallel.sequence_sharded_moe`` it
+    uses ``mark_autoep_folding_partial_router_parameter`` instead). The
     folded router runs redundantly on every TP peer (same tokens, same routing)
     and its gradient is reconstructed into a replicated full view by the restore
     all-gather (see ``deepspeed.moe.ep_tp_dispatch._AllGatherVariableRows`` and
@@ -291,12 +294,14 @@ def mark_autoep_folding_router_parameter(param) -> None:
 def mark_autoep_folding_partial_router_parameter(param) -> None:
     """Tag a router/gate parameter as a *routed-token partial* family (SUM).
 
-    Forward-looking contract; NOT used on the current forward path -- only the
-    unit tests in ``tests/unit/v1/moe/test_autoep_autotp_grad_parity.py`` set
-    it. Use it only for a future design where the router's per-token work is
-    genuinely partitioned across peers and the slices are NOT all-gathered back
-    into a replicated full view, so each peer holds a real partial gradient that
-    must be SUMed. Such a router is a SUM partial in any token-partitioned mode
+    ``AutoEPMoELayer.__init__`` sets it under
+    ``expert_parallel.sequence_sharded_moe``, where each peer routes only its
+    own token shard and the backward of the block's exit all-gather returns
+    each peer its own slice, unscaled, so each peer holds a real partial
+    gradient that must be SUMed
+    (``tests/unit/v1/moe/test_autoep_sequence_sharded.py``). Use it only where
+    the router's per-token work is genuinely partitioned across peers and no
+    all-gather backward scales the slices. Such a router is a SUM partial in any token-partitioned mode
     (``mp_mode in {"tp", "sp"}``) because its partition can ride the existing
     expert-dispatch all-to-all without changing the dense activation layout.
     Prove the SUM with a parity test (like the existing router/gate cases)
@@ -319,6 +324,15 @@ def mark_autoep_folding_sp_sharded_layernorm_parameter(param) -> None:
     must be backed by a parity test before use.
     """
     setattr(param, AUTOEP_FOLDING_PARAM_FAMILY_ATTR, AUTOEP_FOLDING_SP_SHARDED_LAYERNORM_PARAM)
+
+
+def mark_autoep_folding_exact_expert_parameter(param) -> None:
+    """Tag a routed-expert parameter whose gradient reaches the optimizer without a ``tp_size`` factor.
+
+    Under ``expert_parallel.sequence_sharded_moe`` the exit all-gather keeps each peer's own slice in
+    backward instead of all-reducing it, so there is no factor for EXPERT_TP_CANCEL to divide out.
+    """
+    setattr(param, AUTOEP_FOLDING_PARAM_FAMILY_ATTR, AUTOEP_FOLDING_ROUTED_EXPERT_EXACT_PARAM)
 
 
 def _is_moe_param_marker(param) -> bool:
@@ -385,12 +399,18 @@ def autoep_folding_gradient_reduction_strategy(
       is linear and composes with the EDP all_reduce in any order. Without this,
       folded expert gradients are over-scaled by ``tp_size`` -- invisible to
       scale-invariant Adam but real for SGD/Lion/Muon and for gradient clipping
-      (it inflates the expert contribution to the global grad norm).
+      (it inflates the expert contribution to the global grad norm). Under
+      ``sequence_sharded_moe`` the experts are marked exact
+      (``mark_autoep_folding_exact_expert_parameter``) and are SKIP: the exit
+      all-gather's backward returns each peer its own slice, so no factor
+      arises.
 
     Underlying rule and mechanism: a folded parameter is replicated (AVERAGE)
     when the forward reconstructs its partitioned work into an identical full
-    view inside the layer, and a genuine partial (SUM) only when the shard is
-    kept all the way to the loss. Today the router/gate is partitioned across
+    view inside the layer, and a genuine partial (SUM) when no all-gather
+    backward scales the shard's gradient: the shard is kept all the way to the
+    loss, or, as under ``sequence_sharded_moe``, the gather's backward returns
+    each peer its own slice. Under assignment-level folding the router/gate is partitioned across
     TP peers for dispatch but then all-gathered back by ``restore_combined``
     (see ``deepspeed.moe.ep_tp_dispatch``), whose backward scales each peer's
     gradient by ``tp_size``; the TP all_reduce then yields ``tp_size *
@@ -418,6 +438,8 @@ def autoep_folding_gradient_reduction_strategy(
         # factor on the expert-weight gradient (the same factor the replicated
         # router cancels with AVERAGE). Experts are NOT TP-replicated, so they must
         # not be TP all_reduced; the factor is cancelled with a plain ``/tp_size``.
+        if getattr(param, AUTOEP_FOLDING_PARAM_FAMILY_ATTR, None) == AUTOEP_FOLDING_ROUTED_EXPERT_EXACT_PARAM:
+            return AUTOEP_FOLDING_GRAD_REDUCE_SKIP
         return AUTOEP_FOLDING_GRAD_REDUCE_EXPERT_TP_CANCEL
 
     family = _autoep_folding_param_family(param, param_name=param_name)

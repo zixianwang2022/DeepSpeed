@@ -52,6 +52,7 @@ def parse_autoep_config(param_dict: dict) -> AutoEPConfig:
     config.expert_tensor_parallel_size = param_dict.get("expert_tensor_parallel_size", 1)
     config.validate_folding_routing = param_dict.get("validate_folding_routing", False)
     config.async_split_plan = param_dict.get("async_split_plan", False)
+    config.sequence_sharded_moe = param_dict.get("sequence_sharded_moe", False)
     config.preset_model = param_dict.get("preset_model", None)
     config.moe_layer_pattern = param_dict.get("moe_layer_pattern", None)
     config.expert_pattern = param_dict.get("expert_pattern", None)
@@ -131,8 +132,22 @@ def validate_autoep_config(
     if not isinstance(config.async_split_plan, bool):
         raise ValueError("expert_parallel.async_split_plan must be a boolean")
 
+    if not isinstance(config.sequence_sharded_moe, bool):
+        raise ValueError("expert_parallel.sequence_sharded_moe must be a boolean")
+
     if not config.enabled:
         return
+
+    if config.sequence_sharded_moe:
+        if tp_size <= 1:
+            raise ValueError("expert_parallel.sequence_sharded_moe splits the tokens over the tensor-parallel peers, "
+                             "so it needs tensor_parallel.autotp_size > 1.")
+        if config.comm_backend == "deepep":
+            raise ValueError('expert_parallel.sequence_sharded_moe does not support comm_backend="deepep" yet.')
+        if config.validate_folding_routing:
+            raise ValueError("expert_parallel.validate_folding_routing checks the assignments that folding splits "
+                             "over the tensor-parallel peers; expert_parallel.sequence_sharded_moe splits tokens "
+                             "instead. Disable one of the two.")
 
     if config.async_split_plan and config.autoep_size > 1 and tp_size > 1:
         raise ValueError("expert_parallel.async_split_plan does not support AutoEP+AutoTP folding yet. "

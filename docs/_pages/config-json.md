@@ -943,6 +943,12 @@ Configure AutoEP expert parallelism for MoE models. AutoEP automatically detects
 
 This option reduces the host synchronization exposed by reading split sizes; it does not hide the expert-count AllToAll. Benchmark it with your target model, token count, EP size, and hardware before enabling it. For small workloads, stream/event overhead can outweigh the overlap benefit.
 
+***sequence_sharded_moe***: [boolean]
+
+| Description                                                                                                                                                                             | Default |
+| --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
+| Under AutoEP+AutoTP, each tensor-parallel peer runs the router, dispatch, experts and combine on its 1/TP of the tokens, and the block's exit all-gathers one row per token. Needs `tensor_parallel.autotp_size` above 1. Rejects `comm_backend="deepep"`. | `false` |
+
 ***preset_model***: [string]
 
 | Description                                                                                                                            | Default |

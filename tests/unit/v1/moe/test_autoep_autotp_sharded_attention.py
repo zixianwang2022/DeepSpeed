@@ -105,7 +105,7 @@ def _reference_config():
     return config
 
 
-def _folded_config(tp_size, ep_size, zero_stage, offload=False):
+def _folded_config(tp_size, ep_size, zero_stage, offload=False, sequence_sharded=False):
     config = _common_config()
     config["zero_optimization"] = {"stage": zero_stage, "overlap_comm": True, "reduce_scatter": True}
     if offload:
@@ -118,6 +118,8 @@ def _folded_config(tp_size, ep_size, zero_stage, offload=False):
         "preset_model": "deepseek_v3",
         "use_grouped_mm": False,
     }
+    if sequence_sharded:
+        config["expert_parallel"]["sequence_sharded_moe"] = True
     config["tensor_parallel"] = {
         "autotp_size": tp_size,
         "partition_config": {
@@ -243,7 +245,13 @@ def _grad_mismatches(folded, reference, rounding=None):
     return mismatches
 
 
-def _check_folded_matches_reference(tp_size, ep_size, zero_stage, zero_init, offload=False, clip=None):
+def _check_folded_matches_reference(tp_size,
+                                    ep_size,
+                                    zero_stage,
+                                    zero_init,
+                                    offload=False,
+                                    clip=None,
+                                    sequence_sharded=False):
     """Compare a folded run with the unfolded reference: losses, gradients and the global norm.
 
     With ``clip`` both runs clip to that norm and take one optimizer step, and every parameter's
@@ -253,7 +261,7 @@ def _check_folded_matches_reference(tp_size, ep_size, zero_stage, zero_init, off
     config = _tiny_glm4_moe_config()
     reference_model = transformers.Glm4MoeForCausalLM(config).float()
     reference_state = copy.deepcopy(reference_model.state_dict())
-    folded_config = _folded_config(tp_size, ep_size, zero_stage, offload=offload)
+    folded_config = _folded_config(tp_size, ep_size, zero_stage, offload=offload, sequence_sharded=sequence_sharded)
     reference_config = _reference_config()
     if clip is not None:
         # The clipped SGD step then moves the parameters by a vector of norm lr * clip = 1, so each
@@ -350,11 +358,17 @@ SHAPES = [
 @pytest.mark.parametrize("zero_stage, zero_init", STAGES)
 class TestShardedAttentionFolding(DistributedTest):
 
-    def test_grads_and_norm_match_reference(self, world_size, tp_size, ep_size, zero_stage, zero_init):
+    @pytest.mark.parametrize("sequence_sharded", [False, True], ids=["folded", "sequence_sharded"])
+    def test_grads_and_norm_match_reference(self, world_size, tp_size, ep_size, zero_stage, zero_init,
+                                            sequence_sharded):
         if get_accelerator().device_name() == "cpu":
             pytest.skip("AutoEP folding runs on an accelerator")
         assert dist.get_world_size() == world_size
-        _check_folded_matches_reference(tp_size=tp_size, ep_size=ep_size, zero_stage=zero_stage, zero_init=zero_init)
+        _check_folded_matches_reference(tp_size=tp_size,
+                                        ep_size=ep_size,
+                                        zero_stage=zero_stage,
+                                        zero_init=zero_init,
+                                        sequence_sharded=sequence_sharded)
 
 
 class TestMixedExpertClipping(DistributedTest):
@@ -624,13 +638,14 @@ class TestZero3FoldedCheckpoint(DistributedTest):
     """
     world_size = 4
 
+    @pytest.mark.parametrize("sequence_sharded", [False, True], ids=["folded", "sequence_sharded"])
     @pytest.mark.parametrize("zero_init", [False, True])
-    def test_save_load_resumes_training(self, zero_init, tmpdir):
+    def test_save_load_resumes_training(self, zero_init, sequence_sharded, tmpdir):
         if get_accelerator().device_name() == "cpu":
             pytest.skip("AutoEP folding runs on an accelerator")
         tp_size = 2
         config = _tiny_glm4_moe_config()
-        folded_config = _folded_config(tp_size=tp_size, ep_size=2, zero_stage=3)
+        folded_config = _folded_config(tp_size=tp_size, ep_size=2, zero_stage=3, sequence_sharded=sequence_sharded)
         folded_config["optimizer"]["params"]["momentum"] = 0.9
 
         def build_engine(seed):

@@ -766,6 +766,44 @@ Thresholds at half and twice the reference norm cover active clipping and
 an unclipped control, including models built under ``deepspeed.zero.Init``
 at ZeRO stage 3.
 
+Sequence-sharded MoE blocks
+---------------------------
+
+Under AutoEP+AutoTP folding, every tensor-parallel peer runs the router on all tokens, keeps 1/TP of the routed
+rows, and all-gathers the routed rows at the block's exit, which is k rows per token. With
+``sequence_sharded_moe``, every peer keeps 1/TP of the tokens at the block's entry and runs the router, dispatch,
+experts and combine on that shard only. The exit all-gathers one row per token, so the block holds and sends less.
+This follows the sequence-sharded MoE block of X-MoE (`arXiv 2508.13337 <https://arxiv.org/abs/2508.13337>`__).
+
+.. code-block:: json
+
+    {
+      "expert_parallel": {
+        "enabled": true,
+        "autoep_size": 4,
+        "sequence_sharded_moe": true
+      },
+      "tensor_parallel": {
+        "autotp_size": 2
+      }
+    }
+
+- It needs ``tensor_parallel.autotp_size`` above 1, like folding, and also runs only with ``pp_size=1``.
+- ``comm_backend="deepep"`` is rejected.
+- ``output_router_logits`` works: the router auxiliary loss needs every token's logits, and each peer routes only
+  its share, so the layer gathers the logits over the tensor-parallel peers when a recorder reads them (presets
+  whose Transformers recorder AutoEP retargets, such as ``mixtral`` and ``qwen3_moe``) or when it returns them
+  (``qwen3_5_moe``). The gather's backward keeps each peer's rows, so the router gradient stays a partial that is
+  summed over the peers. For a layer of any other preset it is rejected, when the model is converted and at every
+  forward call.
+- ``validate_folding_routing`` is rejected: it checks the assignments that folding splits, and there are none.
+- Token shards are contiguous and their sizes differ by at most one, so the token count need not divide by TP; a
+  peer whose shard is empty runs the block on no rows.
+- The layer's ``tokens_per_expert`` buffer counts the tokens this peer routed; the layer's count is the sum over
+  the tensor-parallel peers.
+- Each peer backpropagates its own shard, so router gradients are true partials that are summed across the
+  peers, and expert gradients need no ``tp_size`` correction.
+
 Chunked causal-LM loss
 ----------------------
 

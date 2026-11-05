@@ -112,6 +112,7 @@ class AutoEPConfig:
     expert_tensor_parallel_size: int = 1
     validate_folding_routing: bool = False
     async_split_plan: bool = False
+    sequence_sharded_moe: bool = False
     preset_model: str | None = None
     moe_layer_pattern: str | None = None
     expert_pattern: str | None = None
@@ -176,6 +177,10 @@ class ForwardContract:
 
 class AutoEPPresetAdapter:
     """Default behavior shared by presets without model-specific parser rules."""
+
+    # Under sequence_sharded_moe, whether retarget_transformers_output_recorders points Transformers' recorder of
+    # router logits at the layer's GatheredRouterLogits, which receives the logits of every token.
+    records_gathered_router_logits_under_sequence_sharding = False
 
     def validate_compatibility(
         self,
@@ -412,6 +417,8 @@ def _retarget_transformers_output_recorders_for_modules(
 class TransformersTopLevelRouterLogitsAdapter(AutoEPPresetAdapter):
     """Retarget Transformers model-level router-logit recorders to AutoEP."""
 
+    records_gathered_router_logits_under_sequence_sharding = True
+
     def __init__(
         self,
         *,
@@ -448,6 +455,13 @@ class TransformersTopLevelRouterLogitsAdapter(AutoEPPresetAdapter):
         router_gate = getattr(getattr(replacement, "router", None), "gate", None)
         if router_gate is None:
             return
+        # Under sequence sharding the gate sees only this peer's tokens; the layer hands the gathered logits to
+        # gathered_router_logits, so the recorder reads there.
+        gathered = getattr(replacement, "gathered_router_logits", None)
+        if gathered is not None:
+            target_class, target_name = gathered.__class__, "gathered_router_logits"
+        else:
+            target_class, target_name = router_gate.__class__, "router.gate"
 
         def module_matches(module: nn.Module) -> bool:
             module_config = getattr(module, "config", None)
@@ -463,6 +477,5 @@ class TransformersTopLevelRouterLogitsAdapter(AutoEPPresetAdapter):
             retargeted_keys=retargeted_keys,
             remove_output_capture_hooks=remove_output_capture_hooks,
             module_matches=module_matches,
-            make_output_recorder=lambda OutputRecorder: OutputRecorder(
-                router_gate.__class__, index=0, layer_name="router.gate"),
+            make_output_recorder=lambda OutputRecorder: OutputRecorder(target_class, index=0, layer_name=target_name),
         )

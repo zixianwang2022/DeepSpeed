@@ -33,7 +33,9 @@ from deepspeed.checkpoint.affine_transfer import PlanBudget, TransferPlan
 from deepspeed.checkpoint.constants import (AFFINE_MAP, AUTOEP_EXPERT_PLACEMENT, AUTOEP_PARAM_EP_RANK,
                                             AUTOEP_PARAM_LOCAL_EXPERTS, AUTOEP_PARAM_LOGICAL_SHAPE, DS_AUTOEP_UC_META)
 from deepspeed.module_inject.auto_ep_config import AutoEPConfig, MoELayerSpec, resolve_autoep_config_defaults
-from deepspeed.module_inject.auto_ep_folding import mark_autoep_folding_router_parameter
+from deepspeed.module_inject.auto_ep_folding import (mark_autoep_folding_exact_expert_parameter,
+                                                     mark_autoep_folding_partial_router_parameter,
+                                                     mark_autoep_folding_router_parameter)
 from deepspeed.ops.triton_ops import autoep_fused_token_ops as fused_token_ops
 from deepspeed.utils import logger
 from deepspeed.module_inject.auto_ep_comm import (COMM_BACKEND, DEEPEP_BACKEND, DeepEPCheckpointReplay, _in_backward,
@@ -547,6 +549,28 @@ def combine_from_routed(
 # ---------------------------------------------------------------------------
 
 
+class GatheredRouterLogits(nn.Module):
+    """Returns its input. Under ``sequence_sharded_moe`` every tensor-parallel peer routes only its token shard, so
+    a Transformers output recorder on ``router.gate`` would see a share of the router logits. The layer calls this
+    module with the logits of all tokens instead, gathered over the tensor-parallel group, and the recorder is
+    pointed at it, so the router auxiliary loss sees what it sees without sequence sharding."""
+
+    def forward(self, logits: torch.Tensor) -> torch.Tensor:
+        return logits
+
+
+def _router_logits_recorded(module: nn.Module) -> bool:
+    """Whether a Transformers output recorder reads what ``module`` returns in the running forward."""
+    if not module._forward_hooks:
+        return False
+    try:
+        from transformers.utils.output_capturing import _active_collector
+    except ImportError:
+        return True
+    collected = _active_collector.get()
+    return collected is not None and "router_logits" in collected
+
+
 class AutoEPMoELayer(nn.Module):
     """Drop-in replacement for HF MoE blocks with Expert Parallelism support."""
 
@@ -603,6 +627,12 @@ class AutoEPMoELayer(nn.Module):
         resolved_config = resolve_autoep_config_defaults(config, spec.model_family)
         self.validate_folding_routing = bool(resolved_config.validate_folding_routing)
         self.async_split_plan = resolved_config.async_split_plan
+        self.sequence_sharded_moe = config.sequence_sharded_moe
+        # Where a Transformers recorder of router logits reads under sequence sharding; see GatheredRouterLogits.
+        self.gathered_router_logits = GatheredRouterLogits() if self.sequence_sharded_moe else None
+        # Whether the last forward gathered them: a recompute in the backward, where no recorder is active, must
+        # repeat the forward's work, or a non-reentrant checkpoint finds fewer saved tensors than the forward saved.
+        self._router_logits_gathered = False
         self._async_split_plan_host_splits = None
         self._async_split_plan_ready_event = None
         self._async_split_plan_dependency_event = None
@@ -724,6 +754,8 @@ class AutoEPMoELayer(nn.Module):
             param.group_name = self.ep_group_name
             param.ds_zero_placement_family = "autoep_expert"
             param.ds_zero_partition_group_name = self.ep_group_name
+            if self.sequence_sharded_moe:
+                mark_autoep_folding_exact_expert_parameter(param)
 
         # Mark shared expert and router params for global DP reduction.
         # The router runs redundantly on every TP peer and its gradient is
@@ -732,7 +764,11 @@ class AutoEPMoELayer(nn.Module):
         # double it under tp_size=2. See mark_autoep_folding_router_parameter.
         for param in self.router.parameters():
             param.allreduce = True
-            mark_autoep_folding_router_parameter(param)
+            if self.sequence_sharded_moe:
+                # Each peer routes only its own token shard, so its gradient is a true partial.
+                mark_autoep_folding_partial_router_parameter(param)
+            else:
+                mark_autoep_folding_router_parameter(param)
             param.ds_zero_placement_family = "replicated"
         if self.shared_experts is not None:
             for param in self.shared_experts.parameters():
@@ -1119,8 +1155,12 @@ class AutoEPMoELayer(nn.Module):
             return deepep_record_combine(exchange, expert_output, handle)
         return deepep_combine(exchange, expert_output, handle)
 
-    def _finalize_output(self, output: torch.Tensor, x: torch.Tensor, hidden_states: torch.Tensor,
-                         hdim: int) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    def _finalize_output(self,
+                         output: torch.Tensor,
+                         x: torch.Tensor,
+                         hidden_states: torch.Tensor,
+                         hdim: int,
+                         token_shard: torch.Tensor | None = None) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Apply the model-specific output tail shared by every communication backend."""
         if self.moe_output_shape == "flat":
             output = output.reshape(-1, hdim)
@@ -1139,16 +1179,31 @@ class AutoEPMoELayer(nn.Module):
                 shared_expert_output = shared_expert_output.reshape_as(output)
             output = output + shared_expert_output
 
+        gather_for_recorder = False
+        if token_shard is not None and not self.return_router_logits and self.router_logits_capture_target == "router":
+            if _in_backward():
+                gather_for_recorder = self._router_logits_gathered
+            else:
+                gather_for_recorder = _router_logits_recorded(self.gathered_router_logits)
+                self._router_logits_gathered = gather_for_recorder
+        if gather_for_recorder:
+            # The recorder reads the raw gate output of every token, as on router.gate without sequence sharding. The
+            # gather's backward keeps this peer's rows, so the auxiliary loss's router gradient is a partial too.
+            self.gathered_router_logits(self._gather_token_shards(self.router.gate(token_shard), x.shape[0]))
+
         if self.return_router_logits:
             logits = None
             if self.router_logits_capture_target == "router":
                 # Keep logits local so checkpoint early-stop cannot leave a graph owned by the layer.
-                logits = self.router.gate(x)
+                logits = self.router.gate(x if token_shard is None else token_shard)
                 if self.router_logits_capture_mode == "post_score":
                     if self.router.score_func == "softmax":
                         logits = torch.softmax(logits.float(), dim=-1).to(logits.dtype)
                     elif self.router.score_func == "sigmoid":
                         logits = torch.sigmoid(logits.float()).to(logits.dtype)
+                if token_shard is not None:
+                    # the block returns logits for every token on every peer, as without sequence sharding
+                    logits = self._gather_token_shards(logits, x.shape[0])
             return output, logits
 
         return output
@@ -1182,16 +1237,33 @@ class AutoEPMoELayer(nn.Module):
                     logger.warning("Failed to drain AutoEP async split plan after forward failed", exc_info=True)
             raise
 
+    def _narrow_token_shard(self, x: torch.Tensor) -> torch.Tensor:
+        from deepspeed.moe.ep_tp_dispatch import _NarrowTokenShard, token_shard_counts
+        counts = token_shard_counts(x.shape[0], self.folding_group_handles.spec.tp_size)
+        return _NarrowTokenShard.apply(x, self.tp_group, counts, dist.get_rank(group=self.tp_group))
+
+    def _gather_token_shards(self, shard: torch.Tensor, num_tokens: int) -> torch.Tensor:
+        from deepspeed.moe.ep_tp_dispatch import _GatherTokenShards, token_shard_counts
+        counts = token_shard_counts(num_tokens, self.folding_group_handles.spec.tp_size)
+        return _GatherTokenShards.apply(shard, self.tp_group, counts, dist.get_rank(group=self.tp_group))
+
     def _forward(self, hidden_states: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         bsz, seqlen, hdim = hidden_states.shape
-        folded_tp = self.folding_group_handles is not None and self.folding_group_handles.spec.tp_size > 1
+        has_folded_tp = self.folding_group_handles is not None and self.folding_group_handles.spec.tp_size > 1
+        # Sequence-sharded block: every peer routes, dispatches and combines only its own token shard, and the
+        # shards are gathered at the block's exit, so none of the assignment-partition machinery below runs.
+        sequence_sharded = has_folded_tp and self.sequence_sharded_moe
+        folded_tp = has_folded_tp and not sequence_sharded
         if folded_tp:
             # Tensor-parallel layers before this one need the same input gradient on every TP peer;
             # see average_gradient_over_tp.
             from deepspeed.moe.ep_tp_dispatch import average_gradient_over_tp
             hidden_states = average_gradient_over_tp(hidden_states, self.tp_group,
                                                      self.folding_group_handles.spec.tp_size)
-        x = hidden_states.reshape(-1, hdim)  # [T, H]
+        all_tokens = hidden_states.reshape(-1, hdim)  # [T, H]
+        token_shard = self._narrow_token_shard(all_tokens) if sequence_sharded else None
+        x = all_tokens if token_shard is None else token_shard
+        num_local_tokens = x.shape[0]
 
         # Fail all ranks before any collective can stall.
         if self.combine_impl == "fused_weighted_sum" and not self._fused_combine_checked:
@@ -1207,7 +1279,7 @@ class AutoEPMoELayer(nn.Module):
 
         pending_plan = None
         if self.async_split_plan and self.ep_size > 1 and self.comm_backend == COMM_BACKEND:
-            if folded_tp:
+            if has_folded_tp:
                 raise RuntimeError("expert_parallel.async_split_plan does not support AutoEP+AutoTP folding yet")
             pending_plan = self._start_async_split_plan(ro.num_tokens_per_expert)
 
@@ -1327,6 +1399,7 @@ class AutoEPMoELayer(nn.Module):
                 shape=(bsz, seqlen, hdim),
             )
         else:
+            combine_shape = (1, num_local_tokens, hdim) if sequence_sharded else (bsz, seqlen, hdim)
             output = combine_from_routed(
                 expert_output,
                 top_scores=ro.top_scores,
@@ -1334,10 +1407,13 @@ class AutoEPMoELayer(nn.Module):
                 top_k=self.top_k,
                 score_apply=self.score_apply,
                 combine_impl=self.combine_impl,
-                shape=(bsz, seqlen, hdim),
+                shape=combine_shape,
             )
+            if sequence_sharded:
+                output = self._gather_token_shards(output.reshape(-1, hdim), all_tokens.shape[0])
+                output = output.reshape(bsz, seqlen, hdim)
 
-        return self._finalize_output(output, x, hidden_states, hdim)
+        return self._finalize_output(output, all_tokens, hidden_states, hdim, token_shard=token_shard)
 
 
 class ReplacementSourceMap:

@@ -413,6 +413,51 @@ class AutoEP:
         self.model_config = getattr(model, 'config', None)
         self._retargeted_transformers_output_recorders: set[str] = set()
         fill_autoep_config_from_hf(self.config, self.model_config)
+        # Under sequence_sharded_moe, the MoE layers whose preset cannot hand every token's router logits to the
+        # model (see _sequence_sharded_router_logits_supported); set when the layers are replaced.
+        self._layers_without_gathered_router_logits: list[str] = []
+        self._refusal_hook = None
+
+    _ROUTER_LOGITS_MESSAGE = ("expert_parallel.sequence_sharded_moe does not support output_router_logits for the MoE "
+                              "layers {}: the router auxiliary loss needs every token's logits, each peer holds only "
+                              "its share, and their preset has no path that gathers them.")
+
+    @staticmethod
+    def _sequence_sharded_router_logits_supported(spec: MoELayerSpec) -> bool:
+        """The layer returns its router logits itself (gathered over the tensor-parallel peers in _finalize_output),
+        or its preset points Transformers' recorder at the gathered logits (GatheredRouterLogits)."""
+        if spec.router_logits_capture_target != "router":
+            return False
+        return spec.return_router_logits or get_preset_adapter(
+            spec.preset_adapter).records_gathered_router_logits_under_sequence_sharding
+
+    def _check_sequence_sharded_router_logits(self, specs: list[MoELayerSpec]) -> None:
+        if not self.config.sequence_sharded_moe:
+            return
+        # replace_moe_layer converts one layer per call: the names add up, and the hook is registered once
+        self._layers_without_gathered_router_logits += [
+            spec.moe_module_name for spec in specs if not self._sequence_sharded_router_logits_supported(spec)
+        ]
+        if not self._layers_without_gathered_router_logits:
+            return
+        # Checked now and at every call: the flag can also arrive as a forward argument or be set later.
+        if self._router_logits_requested(self.model, {}):
+            raise ValueError(self._ROUTER_LOGITS_MESSAGE.format(self._layers_without_gathered_router_logits))
+        if self._refusal_hook is None:
+            self._refusal_hook = self.model.register_forward_pre_hook(self._refuse_router_logits, with_kwargs=True)
+
+    @staticmethod
+    def _router_logits_requested(model: nn.Module, kwargs: dict) -> bool:
+        configs = [getattr(model, 'config', None)]
+        get_text_config = getattr(configs[0], "get_text_config", None)
+        if callable(get_text_config):
+            configs.append(get_text_config())
+        return bool(
+            kwargs.get("output_router_logits") or any(getattr(c, "output_router_logits", False) for c in configs))
+
+    def _refuse_router_logits(self, model: nn.Module, args: tuple, kwargs: dict) -> None:
+        if self._router_logits_requested(model, kwargs):
+            raise RuntimeError(self._ROUTER_LOGITS_MESSAGE.format(self._layers_without_gathered_router_logits))
 
     def ep_parser(self) -> list[MoELayerSpec]:
         """Traverse model and detect MoE layers. Returns list of MoELayerSpec."""
@@ -685,6 +730,7 @@ class AutoEP:
         ep_rank: int,
     ) -> None:
         """Replace a single MoE module with AutoEPMoELayer in-place on the model."""
+        self._check_sequence_sharded_router_logits([spec])
         replacement, _ = self._replace_moe_layer_without_retarget(spec, ep_size, ep_rank)
         self._retarget_transformers_output_recorders(spec, replacement)
 
@@ -712,6 +758,7 @@ class AutoEP:
         """
         from deepspeed.module_inject.auto_ep_layer import ReplacementSourceMap
 
+        self._check_sequence_sharded_router_logits(specs)
         replacements: list[tuple[MoELayerSpec, nn.Module]] = []
         replacement_sources = ReplacementSourceMap()
         for spec in specs:

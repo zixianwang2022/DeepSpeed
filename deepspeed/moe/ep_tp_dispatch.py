@@ -361,6 +361,60 @@ def _all_gather_variable_rows(tensor: torch.Tensor,
     return torch.cat([chunk[:count] for chunk, count in zip(gathered, counts)], dim=0)
 
 
+def token_shard_counts(num_tokens: int, tp_size: int) -> tuple[int, ...]:
+    """Split ``num_tokens`` over ``tp_size`` peers into contiguous shards whose sizes differ by at most one."""
+    base, extra = divmod(num_tokens, tp_size)
+    return tuple(base + 1 if peer < extra else base for peer in range(tp_size))
+
+
+def _all_gather_token_rows(tensor: torch.Tensor, group, counts: tuple[int, ...]) -> torch.Tensor:
+    if min(counts) == max(counts):
+        # Equal shards land in place, in peer order, without padding or a second copy.
+        gathered = tensor.new_empty((sum(counts), *tensor.shape[1:]))
+        dist.allgather_fn(gathered, tensor, group=group)
+        return gathered
+    padded = _pad_rows(tensor, max(counts))
+    gathered = [torch.empty_like(padded) for _ in counts]
+    dist.all_gather(gathered, padded, group=group)
+    return torch.cat([chunk[:count] for chunk, count in zip(gathered, counts)], dim=0)
+
+
+class _NarrowTokenShard(torch.autograd.Function):
+    """Keep this peer's token shard of a replicated tensor; backward gathers the peers' shard gradients.
+
+    The gathered gradient is the full token gradient on every peer, so the tensor-parallel layers
+    before this one see the same input gradient on all peers without an average.
+    """
+
+    @staticmethod
+    def forward(ctx, tensor, group, counts, group_rank):
+        ctx.group = group
+        ctx.counts = counts
+        return tensor.narrow(0, sum(counts[:group_rank]), counts[group_rank])
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return _all_gather_token_rows(grad_output.contiguous(), ctx.group, ctx.counts), None, None, None
+
+
+class _GatherTokenShards(torch.autograd.Function):
+    """All-gather the peers' token shards; backward keeps this peer's slice of the replicated gradient.
+
+    Unlike ``_AllGatherVariableRows`` this adds no ``tp_size`` factor: each peer's shard is backpropagated
+    by that peer alone, so router gradients are true partials (SUM) and expert gradients need no cancel.
+    """
+
+    @staticmethod
+    def forward(ctx, tensor, group, counts, group_rank):
+        ctx.start = sum(counts[:group_rank])
+        ctx.count = counts[group_rank]
+        return _all_gather_token_rows(tensor.contiguous(), group, counts)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output.narrow(0, ctx.start, ctx.count).contiguous(), None, None, None
+
+
 def _debug_validate_restore_coverage(payload: RoutedAssignmentPayload, ctx: RestoreContext,
                                      all_token_indices: torch.Tensor, all_expert_indices: torch.Tensor,
                                      all_assignment_indices: torch.Tensor, all_capacity_slots: torch.Tensor) -> None:
