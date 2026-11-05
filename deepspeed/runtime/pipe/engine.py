@@ -217,7 +217,13 @@ class PipelineEngine(DeepSpeedEngine):
         if self._config.pipeline['activation_checkpoint_interval'] > 0:
             self.module.activation_checkpoint_interval = self._config.pipeline['activation_checkpoint_interval']
         if self.module.activation_checkpoint_interval > 0:
-            self.module._precompute_checkpointable_values()
+            self.module._precompute_checkpointable_values(check_all_stages=True)
+        elif any(getattr(self.module, 'activation_checkpoints_per_stage', None) or []):
+            # Without a checkpoint interval nothing is checkpointed, so the counts would be ignored without a word.
+            raise ValueError(
+                f'activation_checkpoints_per_stage={self.module.activation_checkpoints_per_stage} needs an '
+                'activation checkpoint interval above 0 (PipelineModule activation_checkpoint_interval or '
+                'the config\'s pipeline.activation_checkpoint_interval)')
 
         self.module.checkpoint_parallel_write_pipeline = self._config.checkpoint_parallel_write_pipeline
 

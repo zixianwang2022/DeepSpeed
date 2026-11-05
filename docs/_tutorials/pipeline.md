@@ -269,6 +269,38 @@ by DeepSpeed:
   would balance the number of transformer layers per stage.
 * `partition_method="uniform"` balances the number of layers per stage.
 
+A balanced split is not always the fastest one: the first stage holds the
+activations of more micro-batches than the last stage under the 1F1B
+schedule, and the first and last stages also hold the embedding and the
+output layers. The `layers_per_stage` keyword argument sets the number of
+layers of each stage instead of balancing them. It counts every layer with
+`partition_method="uniform"`, and only the layers whose class names match with
+`partition_method="type:[regex]"`:
+
+```python
+# 6, 8, 8 and 10 transformer layers on the four stages
+net = PipelineModule(layers=layers,
+                     num_stages=4,
+                     partition_method="type:transformer",
+                     layers_per_stage=[6, 8, 8, 10])
+```
+
+In the same way, `activation_checkpoints_per_stage` sets how many of the
+checkpointable blocks of `activation_checkpoint_interval` layers each stage
+checkpoints, counted from the first block of the stage; the other blocks of the
+stage keep their activations. For example, with
+`activation_checkpoint_interval=1` and
+`activation_checkpoints_per_stage=[6, 4, 0, 0]`, the first stage recomputes all
+6 of its transformer layers, the second stage 4 of its 8, and the last two
+stages none.
+
+A pipeline checkpoint stores one file per layer, named by the layer's global
+index, so the weights saved with one split load into a model with another
+`layers_per_stage`: pass `load_optimizer_states=False` (or
+`load_module_only=True`) to `load_checkpoint`. The optimizer state is saved per
+rank for the layers that rank held, and loading it into a different split
+fails with an error.
+
 ### Memory-Efficient Model Construction
 Building a `Sequential` container and providing it to a `PipelineModule` is a convenient way
 of specifying a pipeline parallel model. However, this approach encounters scalability issues

@@ -120,6 +120,19 @@ class PipelineModule(nn.Module):
             ParallelTransformerLayerPipe is always checkpointed regardless of this list. If None, all layers with parameters are
             considered checkpointable. Defaults to None.
         dynamic_shape: Allows dynamic shapes of inputs. This might have a performance impact.
+        layers_per_stage (list[int], optional): The number of layers each stage holds, one entry per stage, instead of
+            the balanced split of ``partition_method``. With ``partition_method="uniform"`` every layer counts; with
+            ``partition_method="type:[regex]"`` only the layers whose class names match count, and the other layers
+            stay with the counted layer before them (the layers before the first counted layer go to the first stage).
+            For example, ``layers_per_stage=[6, 8, 8, 10]`` with ``partition_method="type:transformer"`` puts 6, 8, 8 and
+            10 transformer layers on the four stages. Defaults to None.
+        activation_checkpoints_per_stage (list[int], optional): The number of checkpointable blocks of
+            ``activation_checkpoint_interval`` layers that each stage checkpoints, one entry per stage, counted from the
+            first block of the stage; the later blocks of the stage run without activation checkpointing. A count
+            above 0 needs an activation checkpoint interval above 0 (this argument or the config's
+            ``pipeline.activation_checkpoint_interval``). With ``partition_method="type:[regex]"`` only blocks
+            that hold a layer of that type count; otherwise every checkpointable block counts, an embedding included
+            (a warning says so). Defaults to None, which checkpoints every checkpointable block.
     """
 
     def __init__(self,
@@ -134,7 +147,9 @@ class PipelineModule(nn.Module):
                  activation_checkpoint_interval=0,
                  activation_checkpoint_func=checkpointing.checkpoint,
                  checkpointable_layers=None,
-                 dynamic_shape=False):
+                 dynamic_shape=False,
+                 layers_per_stage=None,
+                 activation_checkpoints_per_stage=None):
 
         super().__init__()
 
@@ -148,6 +163,9 @@ class PipelineModule(nn.Module):
         self.checkpointable_layers = checkpointable_layers
         if checkpointable_layers is not None:
             assert isinstance(checkpointable_layers, list), "param `checkpointable_layers` must be type of list."
+
+        self.layers_per_stage = layers_per_stage
+        self.activation_checkpoints_per_stage = activation_checkpoints_per_stage
 
         self.seed_layers = seed_layers
         self.seed_fn = seed_fn
@@ -191,6 +209,15 @@ class PipelineModule(nn.Module):
         self._local_stop = None
         self._partition_layers(method=partition_method)
 
+        num_parts = len(self.parts) - 1
+        if activation_checkpoints_per_stage is not None:
+            if len(activation_checkpoints_per_stage) != num_parts:
+                raise ValueError(f'activation_checkpoints_per_stage needs one entry per stage ({num_parts}), '
+                                 f'got {activation_checkpoints_per_stage}')
+            if any(not isinstance(n, int) or n < 0 for n in activation_checkpoints_per_stage):
+                raise ValueError(f'activation_checkpoints_per_stage needs non-negative integers, '
+                                 f'got {activation_checkpoints_per_stage}')
+
         self.forward_funcs = []
         self.fwd_map = {}
         self.tied_modules = nn.ModuleDict()
@@ -218,18 +245,84 @@ class PipelineModule(nn.Module):
 
         self.dynamic_shape = dynamic_shape
 
-    def _precompute_checkpointable_values(self):
+    def _precompute_checkpointable_values(self, check_all_stages=False):
+        """``check_all_stages`` (the engine sets it when it is built) makes every rank check every stage's entry of
+        ``activation_checkpoints_per_stage``; it runs a collective, so it must be called on all ranks together."""
         if self.activation_checkpoint_interval > 0 and self.is_checkpointable_results_interval != self.activation_checkpoint_interval:
             num_layers = len(self.forward_funcs)
             self.interval_was_zero = False
             # results are cached per interval, so any left over from a previous interval no longer
             # line up with the layer blocks forward() builds and must not be carried over
             self.is_checkpointable_results = []
+            blocks = []
             for start_idx in range(0, num_layers, self.activation_checkpoint_interval):
                 end_idx = min(start_idx + self.activation_checkpoint_interval, num_layers)
                 funcs = self.forward_funcs[start_idx:end_idx]
+                blocks.append(funcs)
                 self.is_checkpointable_results.append(self._is_checkpointable(funcs))
+            if self.activation_checkpoints_per_stage is not None:
+                self._warn_if_counts_may_include_an_embedding()
+                # Only the first checkpointable blocks of the stage are checkpointed. With partition_method
+                # "type:[regex]" a block counts only if it holds a layer of that type, so that the counts refer to the
+                # layers that layers_per_stage counts; a block without one (an embedding, say) is not checkpointed.
+                stage = self._partition_index()
+                asked = self.activation_checkpoints_per_stage
+                counted = [
+                    is_checkpointable
+                    and (self._counted_layer_regex is None
+                         or any(self._counted_layer_regex.search(f.__class__.__name__) for f in funcs))
+                    for is_checkpointable, funcs in zip(self.is_checkpointable_results, blocks)
+                ]
+                available = {stage: sum(counted)}
+                if check_all_stages:
+                    # What a stage can checkpoint depends on its built layers, which only its own ranks hold. The
+                    # ranks exchange their numbers, so that a count too large for one stage raises on every rank
+                    # instead of leaving the other stages waiting for the one that raised.
+                    have = torch.full((len(asked), ),
+                                      -1,
+                                      dtype=torch.long,
+                                      device=get_accelerator().device_name(self.local_rank))
+                    have[stage] = available[stage]
+                    dist.all_reduce(have, op=dist.ReduceOp.MAX, group=self.world_group)
+                    available = {s: n for s, n in enumerate(have.tolist()) if n >= 0}
+                for s, n in sorted(available.items()):
+                    if asked[s] > n:
+                        raise ValueError(f'activation_checkpoints_per_stage[{s}] is {asked[s]}, but stage {s} has '
+                                         f'only {n} checkpointable blocks')
+                num_kept = 0
+                for block_idx, is_counted in enumerate(counted):
+                    self.is_checkpointable_results[block_idx] = is_counted and num_kept < asked[stage]
+                    num_kept += is_counted
             self.is_checkpointable_results_interval = self.activation_checkpoint_interval
+
+    def _warn_if_counts_may_include_an_embedding(self):
+        """Without a "type:[regex]" partition or checkpointable_layers, every block with parameters counts, an
+        embedding too, and reentrant checkpointing of a block whose input needs no gradient (token ids) leaves that
+        block without parameter gradients. Called once the engine has set the checkpoint function."""
+        if (self._counted_layer_regex is not None or self.checkpointable_layers is not None
+                or self.activation_checkpoint_func is checkpointing.non_reentrant_checkpoint
+                or self.__class__.__name__ in ('GPTModelPipe', 'GPT2ModelPipe') or self.global_rank != 0
+                or getattr(self, '_warned_counts_include_embedding', False)):
+            return
+        self._warned_counts_include_embedding = True
+        logger.warning(
+            'activation_checkpoints_per_stage counts every block with parameters, an embedding included, '
+            'because partition_method is not "type:[regex]" and checkpointable_layers is not set. Reentrant '
+            'checkpointing of a block whose input needs no gradient (token ids) leaves that block without '
+            'parameter gradients. Set partition_method to "type:<your block class>" or list the blocks in '
+            'checkpointable_layers.')
+
+    def _partition_index(self):
+        # the index into self.parts of the layers that forward() runs
+        return self.stage_id
+
+    @staticmethod
+    def _layer_spec_name(layer):
+        if isinstance(layer, LayerSpec):
+            return layer.typename.__name__
+        if isinstance(layer, nn.Module):
+            return layer.__class__.__name__
+        return getattr(layer, '__name__', None)
 
     def _build(self):
         specs = self._layer_specs
@@ -322,17 +415,8 @@ class PipelineModule(nn.Module):
         idxs = []
         typeregex = regex.compile(layername, regex.IGNORECASE)
         for idx, layer in enumerate(self._layer_specs):
-            name = None
-            if isinstance(layer, LayerSpec):
-                name = layer.typename.__name__
-            elif isinstance(layer, nn.Module):
-                name = layer.__class__.__name__
-            else:
-                try:
-                    name = layer.__name__
-                except AttributeError:
-                    continue
-            if typeregex.search(name):
+            name = self._layer_spec_name(layer)
+            if name is not None and typeregex.search(name):
                 idxs.append(idx)
 
         if len(idxs) == 0:
@@ -400,11 +484,25 @@ class PipelineModule(nn.Module):
             logger.info(f'Partitioning pipeline stages with method {method}')
 
         method = method.lower()
+        # the layer type that activation_checkpoints_per_stage counts (None: every checkpointable block)
+        self._counted_layer_regex = regex.compile(method.split(':', 1)[1],
+                                                  regex.IGNORECASE) if method.startswith('type:') else None
+
+        if self.layers_per_stage is not None:
+            if len(self.layers_per_stage) != num_stages:
+                raise ValueError(
+                    f'layers_per_stage needs one entry per stage ({num_stages}), got {self.layers_per_stage}')
+            if method != 'uniform' and not method.startswith('type:'):
+                raise ValueError(f"layers_per_stage counts layers, so it needs partition_method 'uniform' or "
+                                 f"'type:[regex]', got '{method}'")
 
         # Each stage gets a simple uniform number of layers.
         if method == 'uniform':
             num_layers = len(self._layer_specs)
-            self.parts = ds_utils.partition_uniform(num_items=num_layers, num_parts=num_stages)
+            if self.layers_per_stage is None:
+                self.parts = ds_utils.partition_uniform(num_items=num_layers, num_parts=num_stages)
+            else:
+                self.parts = ds_utils.partition_by_counts(weights=[1] * num_layers, counts=self.layers_per_stage)
         elif method == 'parameters':
             param_counts = self._count_layer_params()
             self.parts = ds_utils.partition_balanced(weights=param_counts, num_parts=num_stages)
@@ -413,7 +511,10 @@ class PipelineModule(nn.Module):
             binary_weights = [0] * len(self._layer_specs)
             for idx in self._find_layer_type(layertype):
                 binary_weights[idx] = 1
-            self.parts = ds_utils.partition_balanced(weights=binary_weights, num_parts=num_stages)
+            if self.layers_per_stage is None:
+                self.parts = ds_utils.partition_balanced(weights=binary_weights, num_parts=num_stages)
+            else:
+                self.parts = ds_utils.partition_by_counts(weights=binary_weights, counts=self.layers_per_stage)
         elif method == 'profile':
             raise NotImplementedError(f'Partitioning method {method} not implemented.')
         else:

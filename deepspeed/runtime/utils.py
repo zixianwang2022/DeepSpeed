@@ -740,6 +740,33 @@ def partition_balanced(weights, num_parts):
     return parts
 
 
+def partition_by_counts(weights, counts):
+    """Split ``weights`` into ``len(counts)`` contiguous parts, part ``p`` holding ``counts[p]`` of the items whose
+    weight is nonzero.
+
+    Every part after the first starts at one of its counted items, so items of zero weight before the first counted
+    item belong to the first part, and every other item of zero weight belongs to the part of the counted item before
+    it.
+
+    Example:
+        >>> partition_by_counts([0, 1, 1, 1, 1, 0], [1, 3])
+        [0, 2, 6]
+    """
+    positions = [idx for idx, weight in enumerate(weights) if weight]
+    if any(count < 1 for count in counts):
+        raise ValueError(f'every part must hold at least one counted item, got counts {counts}')
+    if sum(counts) != len(positions):
+        raise ValueError(f'counts {counts} sum to {sum(counts)}, but {len(positions)} items are counted')
+
+    parts = [0]
+    num_counted = 0
+    for count in counts[:-1]:
+        num_counted += count
+        parts.append(positions[num_counted])
+    parts.append(len(weights))
+    return parts
+
+
 class PartitionedTensor:
 
     def __init__(self, tensor, group, partition_meta=None):

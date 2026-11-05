@@ -44,6 +44,11 @@ class DualPipeVModule(PipelineModule):
         mirror = self.num_stages - 1 - self.stage_id
         self.phase_bounds = [(self._local_start, self._local_stop), (self.parts[mirror], self.parts[mirror + 1])]
 
+    def _partition_index(self):
+        if self.active_phase == 0:
+            return self.stage_id
+        return self.num_stages - 1 - self.stage_id
+
     def stage_owner(self, layer_idx):
         """The pipeline rank that owns ``layer_idx``."""
         stage = super().stage_owner(layer_idx)
@@ -66,13 +71,13 @@ class DualPipeVModule(PipelineModule):
         self.is_checkpointable_results = self.phase_checkpointable[phase]
         self._local_start, self._local_stop = self.phase_bounds[phase]
 
-    def _precompute_checkpointable_values(self):
+    def _precompute_checkpointable_values(self, check_all_stages=False):
         for phase in (0, 1):
             self.activate_phase(phase)
             # the parent caches per interval
             # the cache must not carry over between phases
             self.is_checkpointable_results_interval = None
-            super()._precompute_checkpointable_values()
+            super()._precompute_checkpointable_values(check_all_stages)
             self.phase_checkpointable[phase] = self.is_checkpointable_results
 
     def save_state_dict(self, *args, **kwargs):

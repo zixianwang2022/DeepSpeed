@@ -10,6 +10,7 @@ import deepspeed.comm as dist
 
 from deepspeed.runtime.utils import partition_uniform
 from deepspeed.runtime.utils import partition_balanced
+from deepspeed.runtime.utils import partition_by_counts
 from deepspeed.runtime.utils import prefix_sum_inc
 from deepspeed.runtime.utils import PartitionedTensor
 from deepspeed.accelerator import get_accelerator
@@ -156,6 +157,27 @@ def test_int_balanced():
     assert_valid_partition(weights, parts, P)
     costs = get_partition_weights(weights, parts)
     assert all(c == 3 for c in costs)
+
+
+def test_partition_by_counts():
+    # two layers that do not count before six counted layers and three after them, like the embedding and the head
+    # around the transformer layers of a GPT model
+    weights = [0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0]
+    counts = [2, 3, 1]
+    parts = partition_by_counts(weights, counts)
+    assert_valid_partition(weights, parts, len(counts))
+    assert get_partition_weights(weights, parts) == counts
+    # the layers that do not count stay with their neighbors: the first two on the first part, the last three on
+    # the last part
+    assert parts == [0, 4, 7, 11]
+
+
+def test_partition_by_counts_rejects_counts_that_do_not_fit():
+    weights = [1, 1, 1, 1]
+    with pytest.raises(ValueError):
+        partition_by_counts(weights, [1, 2])
+    with pytest.raises(ValueError):
+        partition_by_counts(weights, [0, 4])
 
 
 def test_float_balanced():
