@@ -301,6 +301,106 @@ index, so the weights saved with one split load into a model with another
 rank for the layers that rank held, and loading it into a different split
 fails with an error.
 
+#### Choosing the split with the planner
+
+`deepspeed.runtime.pipe.planner` chooses `layers_per_stage` and
+`activation_checkpoints_per_stage` from measurements of the model's layer
+types, so that every stage fits its device and the slowest stage is as fast
+as possible. Its search is the one of X-MoE-4D's pipeline planner (ELM-PP).
+It has three parts:
+
+1. **Profile.** `profile_layer_types` builds one layer of each type, outside
+   the training loop, and measures its forward and backward time with and
+   without recompute, the memory a micro-batch keeps until its backward, the
+   peaks of the forward and of the backward, its parameter list and the size
+   of its buffers. `write_costs` stores the result in a costs file.
+2. **Predict.** `StageModel` computes, for any split, what every stage
+   allocates at the three peaks of a step (the 1F1B schedule, the gradient
+   reduction and the optimizer step) and how long the step takes. The memory
+   terms are either computed from what DeepSpeed allocates (ZeRO stage 1,
+   bf16, the 1F1B schedule) or taken from the costs file; none is fitted to a
+   run, and each one is described in `planner/memory.py`. Where the code
+   allows a range the model takes the upper end, so a stage is predicted to
+   need at least what it uses.
+3. **Search.** A stage gets the fewest recomputed blocks with which it fits
+   the budget. `plan` returns the split whose slowest stage is fastest, found
+   by a dynamic program over the number of blocks on the first stages. Under
+   1F1B the first micro-batch crosses every stage once and each further
+   micro-batch follows after the time of the slowest stage, so with many
+   micro-batches per step the slowest stage sets the step time. Among several
+   micro-batch sizes the planner takes the one with the shortest step.
+
+A stage fits when its `reserve` is within the budget, and `reserve` is more
+than the largest allocation. PyTorch's allocator keeps a freed block and cuts
+it for later, smaller requests, and it cannot move a live tensor. The gradient
+reduction and the optimizer step allocate a few large tensors that the 1F1B
+phase does not hold; if the 1F1B phase grows into the space they left, the
+next reduction can find no block of the size it needs although as much memory
+is free. So `reserve` lays the three phases side by side.
+
+```bash
+python -m deepspeed.runtime.pipe.planner plan --costs costs.json \
+    --layers 'Embed,Block*32,Head' --blocks Block \
+    --world 32 --pp 4 --ep 8 --global-batch 128 --device-gib 64
+```
+
+The command prints, for every micro-batch size in `--mbs-list` (by default
+every size that the costs file holds), the best split, the time and the memory of each stage, and a line `BEST {...}`
+with the `layers_per_stage` and `activation_checkpoints_per_stage` to pass to
+`PipelineModule`. After it come two reference lines for the even split at the
+same micro-batch size, with no block and with every block recomputed.
+`predict` prints the same for a split given with `--parts` and `--ckpts`
+(the even split by default). `balance-memory` returns the split whose largest
+stage memory is smallest when every block is recomputed (`--recompute all`)
+or none, for the largest micro-batch size that fits.
+
+The step time adds two terms to the measured layer times, as in X-MoE-4D:
+`--overhead-ms`, the time every stage spends on a micro-batch outside its
+layers, and `--optimizer-ratio`, the optimizer step as a share of the forward
+and backward passes. Their defaults, 55 ms and 0.10, are the defaults of
+X-MoE-4D's planner (`mb_framework_overhead_ms` and `optimizer_step_ratio` in
+its `ELM_planner.py`), where the 55 ms stands for kernel launches, the MoE
+all-to-all latency and the pipeline's send and receive of every micro-batch.
+Neither changes the split. The predicted step is a guide, not a measurement:
+on a 63B model with DeepSpeed's MoE layer (fixed capacity) it was 21.0 s
+against 16.8 s measured, because the layer times measured here already contain
+the all-to-all (18.1 s with both terms set to 0); with AutoEP's MoE layer and
+an untrained router, whose busiest expert-parallel rank paces every MoE layer,
+it was 25.9 s against about 29.8 s. The overhead matters when several
+micro-batch sizes are compared, because a larger size has fewer micro-batches
+per step, so set it from a run of your own model when you pass more than one
+size. The optimizer share scales every step time alike.
+
+`--headroom-gib` (default 4) is the device memory the plan may
+not use: what the device holds outside PyTorch's allocator (its context and the
+communication library; the used memory that `nvidia-smi` or `rocm-smi` reports
+minus `torch.cuda.memory_reserved()`, 3.0 GiB on the AMD MI250X GPUs of the
+example's results), plus a margin. X-MoE-4D keeps 2.5 GiB free, but its memory
+formula predicts 7 to 25 GB more than a stage uses, while this model
+predicted 0.4 to 1.6 GiB more on the 63B runs, so here the headroom must hold
+what lies outside the allocator. `--inplace-optimizer` tells the model that
+the optimizer updates in place, as DeepSpeed's FusedAdam does; without it the
+model leaves room for the temporaries of `torch.optim`'s Adam and AdamW.
+`--input-bytes` and `--label-bytes` add what a micro-batch's inputs and labels
+hold on the device; token ids are small enough to leave out.
+
+The model covers ZeRO stage 1 with bf16 parameters, gradients and
+communication, `activation_checkpoint_interval=1`, a
+`partition_method="type:[regex]"` whose type is the block that `--blocks`
+names, and layers that take one tensor and return one tensor. It has been
+validated without tensor parallelism. With an MoE layer that drops no token, such as
+AutoEP's, a block's memory follows the rows its rank receives, and in training
+the busiest expert-parallel rank receives more than the mean. Profile such a
+block's memory with its rank receiving the imbalance you expect: on a 63B model
+whose busiest rank received 2.2 to 2.4 times the mean rows, a profile at the
+router's own routing on random inputs predicted 2.6 to 6.0 GiB per stage too
+little, and one at 2.5 times the mean predicted 1.1 to 2.8 GiB more than the
+stages allocated. The DeepSpeedExamples profiler does this with
+`--routing-imbalance`. A complete example,
+with a profiling script and a training script that prints the measured memory
+of each stage next to the prediction, is in
+[DeepSpeedExamples](https://github.com/deepspeedai/DeepSpeedExamples/tree/master/training/pipeline_planner).
+
 ### Memory-Efficient Model Construction
 Building a `Sequential` container and providing it to a `PipelineModule` is a convenient way
 of specifying a pipeline parallel model. However, this approach encounters scalability issues
