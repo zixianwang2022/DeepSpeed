@@ -2721,7 +2721,13 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         if pg_utils.is_parallel(self.model_parallel_group):
             dist.all_reduce(tensor=tensor, op=op, group=self.model_parallel_group)
 
-    def get_grad_norm_direct(self, gradients, params, norm_type=2, process_group=None, expert_parallel_group=None):
+    def get_grad_norm_direct(self,
+                             gradients,
+                             params,
+                             norm_type=2,
+                             process_group=None,
+                             expert_parallel_group=None,
+                             model_parallel_reduce=True):
         """Clips gradient norm of an iterable of parameters.
 
         This is adapted from torch.nn.utils.clip_grad.clip_grad_norm_ and
@@ -2736,6 +2742,10 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
         Returns:
             Total norm of the parameters (viewed as a single vector).
+
+        With ``model_parallel_reduce=False`` the norm is reduced over ``process_group`` only and returned
+        unmasked; the caller adds the model-parallel ranks (the pipeline stages) once for all groups, see
+        ``scaled_global_norm``.
         """
         norm_type = float(norm_type)
         if process_group is None:
@@ -2748,10 +2758,10 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             dist.all_reduce(total_norm, op=dist.ReduceOp.MAX, group=process_group)
 
             # Take max across all GPUs.
-            if expert_parallel_group is None:
-                self._model_parallel_all_reduce(tensor=total_norm, op=dist.ReduceOp.MAX)
-            else:
+            if expert_parallel_group is not None:
                 dist.all_reduce(total_norm, op=dist.ReduceOp.MAX, group=expert_parallel_group)
+            elif model_parallel_reduce:
+                self._model_parallel_all_reduce(tensor=total_norm, op=dist.ReduceOp.MAX)
         else:
             param_gradients = (g for g in gradients if not getattr(g, "_zero_padding", False))
             for g, p in zip(param_gradients, params):
@@ -2772,15 +2782,17 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             # Sum across all model parallel Device.
             dist.all_reduce(total_norm, op=dist.ReduceOp.SUM, group=process_group)
 
-            if expert_parallel_group is None:
-                self._model_parallel_all_reduce(tensor=total_norm, op=dist.ReduceOp.SUM)
-            else:
+            if expert_parallel_group is not None:
                 # Folded EP spans TP peers: each owns different experts. Sum their
                 # partitions over expert DP and EP instead of filtering to TP rank zero.
                 dist.all_reduce(total_norm, op=dist.ReduceOp.SUM, group=expert_parallel_group)
+            elif model_parallel_reduce:
+                self._model_parallel_all_reduce(tensor=total_norm, op=dist.ReduceOp.SUM)
 
             total_norm = total_norm.pow(1. / norm_type)
 
+        if not model_parallel_reduce:
+            return total_norm
         mask_nan_or_inf_with_val_inplace(total_norm, device=self.device)
 
         return total_norm
@@ -3038,6 +3050,13 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
     def scaled_global_norm(self, norm_type=2):
         assert norm_type == 2, "only L2 norm supported"
+        # When the model-parallel group spans ranks (pipeline stages, tensor-parallel ranks), the norm is reduced over
+        # it once for all parameter groups instead of once per group. Every rank of a group must call a collective
+        # the same number of times, and pipeline stages with different numbers of layers can have different numbers
+        # of parameter groups (MoE expert groups are split by max_group_size). AutoEP+AutoTP folding, which runs
+        # without pipeline parallelism, keeps its own reduction over the expert-parallel group.
+        reduce_once = (not self.cpu_offload and self.autoep_folding_spec is None
+                       and pg_utils.is_parallel(self.model_parallel_group))
         norm_groups = []
         for i, group in enumerate(self.bit16_groups):
             if self.cpu_offload:
@@ -3051,11 +3070,21 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                 norm = self.get_grad_norm_direct(self.averaged_gradients[i],
                                                  self.params_in_partition[i],
                                                  process_group=partition_group,
-                                                 expert_parallel_group=expert_group)
+                                                 expert_parallel_group=expert_group,
+                                                 model_parallel_reduce=not reduce_once)
                 if self._muon_update_lacks_loss_scale(i):
                     # Leave the -1 an invalid norm is masked to as it is.
                     norm = torch.where(norm >= 0, norm * self.loss_scale, norm)
                 norm_groups.append(norm)
+
+        if reduce_once:
+            # This rank's groups are combined (infinite if one of them is invalid) and the squares are summed over
+            # the model-parallel ranks: the value that one reduction per group gives. The expert average below is
+            # left out because it would change nothing: after the data-parallel and the model-parallel reductions,
+            # which together cover every rank, a group's norm is the same on all ranks.
+            total_sq = combine_grad_norm_groups(norm_groups, norm_type=norm_type).float().pow(2)
+            self._model_parallel_all_reduce(tensor=total_sq, op=dist.ReduceOp.SUM)
+            return total_sq.sqrt()
 
         if self.has_moe_layers:
             self._average_expert_grad_norms(norm_groups)
