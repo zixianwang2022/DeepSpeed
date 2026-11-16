@@ -262,11 +262,14 @@ def _run_experts_for_loop(
     )
 
     cast_dtype = x.dtype
+    # Split each weight once: indexing w[i] inside the loop makes the backward of every
+    # expert allocate a zero tensor of the whole weight, a cost quadratic in the local experts.
+    w1_experts, w2_experts, w3_experts = w1.unbind(0), w2.unbind(0), w3.unbind(0)
     out_experts_splits = []
     for expert_idx, x_expert in enumerate(x_splits):
-        w1_e = w1[expert_idx].to(cast_dtype).transpose(-2, -1)
-        w3_e = w3[expert_idx].to(cast_dtype).transpose(-2, -1)
-        w2_e = w2[expert_idx].to(cast_dtype).transpose(-2, -1)
+        w1_e = w1_experts[expert_idx].to(cast_dtype).transpose(-2, -1)
+        w3_e = w3_experts[expert_idx].to(cast_dtype).transpose(-2, -1)
+        w2_e = w2_experts[expert_idx].to(cast_dtype).transpose(-2, -1)
         gate = torch.matmul(x_expert, w1_e)
         up = torch.matmul(x_expert, w3_e)
         # fused=False keeps the reference path in plain PyTorch, so it still runs on CPU tensors.

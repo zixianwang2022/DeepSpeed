@@ -32,6 +32,7 @@ from deepspeed.moe.ep_experts import (
     EXPERT_ACTIVATIONS,
     ExpertWeightGradSlot,
     GroupedExperts,
+    _run_experts_for_loop,
     _zero_empty_expert_grad,
     apply_expert_activation,
     apply_packed_expert_activation,
@@ -958,3 +959,70 @@ class TestMiniMaxM3Block:
         out.sum().backward()
         out_ref.sum().backward()
         torch.testing.assert_close(x.grad, x_ref.grad, rtol=1e-4, atol=1e-5 * x_ref.grad.abs().mean().item())
+
+
+class TestExpertLoop:
+    """AutoEP's reference expert loop (``_run_experts_for_loop``) against one separate weight tensor per expert."""
+
+    @staticmethod
+    def _per_expert_reference(w1, w2, w3, x, counts, activation):
+        leaves = [[w[e].detach().clone().requires_grad_(True) for e in range(w.shape[0])] for w in (w1, w2, w3)]
+        outs, start = [], 0
+        for e, n in enumerate(counts):
+            xe = x[start:start + n]
+            start += n
+            gate = xe @ leaves[0][e].to(x.dtype).t()
+            up = xe @ leaves[2][e].to(x.dtype).t()
+            h = apply_expert_activation(gate, up, activation, fused=False)
+            outs.append(h @ leaves[1][e].to(x.dtype).t())
+        out = torch.cat(outs, dim=0)
+        out = torch.vstack((out, out.new_zeros((x.shape[0] - start, out.shape[-1]))))
+        return out, leaves
+
+    @pytest.mark.parametrize("x_dtype", [torch.float32, torch.bfloat16])
+    @pytest.mark.parametrize("activation", ["swiglu", "geglu_tanh", "swiglu_oai"])
+    def test_matches_per_expert_weights_bitwise(self, x_dtype, activation):
+        torch.manual_seed(0)
+        experts, dim, hidden = 5, 16, 24
+        counts = [3, 0, 7, 1, 4]  # an expert without tokens
+        padding = 2  # rows appended by generate_permute_indices
+        w1 = torch.randn(experts, hidden, dim, requires_grad=True)
+        w2 = torch.randn(experts, dim, hidden, requires_grad=True)
+        w3 = torch.randn(experts, hidden, dim, requires_grad=True)
+        x = torch.randn(sum(counts) + padding, dim).to(x_dtype)
+        x_ref = x.clone()
+        x.requires_grad_(True)
+        x_ref.requires_grad_(True)
+        grad_out = torch.randn(x.shape[0], dim).to(x_dtype)
+
+        out = _run_experts_for_loop(w1, w2, w3, x, torch.tensor(counts), activation=activation)
+        out.backward(grad_out)
+        ref, leaves = self._per_expert_reference(w1, w2, w3, x_ref, counts, activation)
+        ref.backward(grad_out)
+
+        assert torch.equal(out, ref)
+        assert torch.equal(x.grad, x_ref.grad)
+        for w, per_expert in zip((w1, w2, w3), leaves):
+            ref_grads = [leaf.grad if leaf.grad is not None else torch.zeros_like(leaf) for leaf in per_expert]
+            assert torch.equal(w.grad, torch.stack(ref_grads))
+        assert torch.count_nonzero(w1.grad[1]) == 0  # the expert without tokens gets a zero gradient
+
+    def test_backward_does_not_index_each_expert(self):
+        # Pins a fixed performance bug. Indexing w[e] per expert makes the backward of every expert allocate a zero
+        # tensor of the whole weight, a cost quadratic in the local experts (210 of the 351 ms of a block's backward
+        # with 32 experts per GPU on an MI250X). No select node may reach the weights.
+        experts, dim, hidden = 8, 8, 12
+        w1 = torch.randn(experts, hidden, dim, requires_grad=True)
+        w2 = torch.randn(experts, dim, hidden, requires_grad=True)
+        w3 = torch.randn(experts, hidden, dim, requires_grad=True)
+        x = torch.randn(2 * experts, dim)
+        out = _run_experts_for_loop(w1, w2, w3, x, torch.full((experts, ), 2))
+        seen, stack, names = set(), [out.grad_fn], []
+        while stack:
+            node = stack.pop()
+            if node is None or node in seen:
+                continue
+            seen.add(node)
+            names.append(type(node).__name__)
+            stack.extend(next_fn for next_fn, _ in node.next_functions)
+        assert "SelectBackward0" not in names
